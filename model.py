@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import tensorflow as tf
 from tensorflow import keras
 
@@ -19,7 +17,6 @@ class ProjectionLayer(keras.layers.Layer):
             layers.append(keras.layers.Activation("relu"))
         layers.append(keras.layers.Dense(self.output_size, kernel_initializer=kernel_initializer, use_bias=False))
         layers.append(keras.layers.BatchNormalization(center=False))
-        # layers.append(keras.layers.ActivationStdLoggingLayer("proj_std"))
         self.projection = keras.Sequential(layers)
 
     def call(self, input_tensor, training=None):
@@ -42,10 +39,6 @@ class ContrastiveModel(keras.Model):
         loss = self.compiled_loss(z1, z2)
         return loss
 
-    @property
-    def metrics(self):
-        return super().metrics
-
     def train_step(self, data):
         view1, view2 = data
 
@@ -63,41 +56,8 @@ class ContrastiveModel(keras.Model):
         self._forward(view1, view2, training=False)
         return {m.name: m.result() for m in self.metrics}
 
-    def save(
-        self,
-        filepath,
-        overwrite=True,
-        include_optimizer=True,
-        save_format=None,
-        signatures=None,
-        options=None,
-        save_traces=True,
-    ):
-        self.backbone.save(
-            Path(filepath) / "backbone",
-            overwrite=overwrite,
-            include_optimizer=include_optimizer,
-            save_format=save_format,
-            signatures=signatures,
-            options=options,
-            save_traces=save_traces,
-        )
-
 
 def contrastive_model():
-    projector = ProjectionLayer(num_layers=2, output_size=512)
+    projector = ProjectionLayer(num_layers=2, output_size=256)
     backbone = keras.applications.resnet.ResNet50(weights=None, include_top=False, pooling="avg")
-
     return ContrastiveModel(backbone, projector)
-
-
-def supervised_model(image_size, dropout=0.2, pretrained_path=None):
-
-    inputs = tf.keras.Input(shape=(image_size, image_size, 3))
-    x = tf.keras.applications.resnet.ResNet50(
-        include_top=False, weights=None, input_shape=(image_size, image_size, 3), pooling="avg"
-    )(inputs)
-    x = tf.keras.layers.Dropout(dropout)(x)
-    outputs = keras.layers.Dense(10)(x)
-    model = tf.keras.Model(inputs, outputs)
-    return model

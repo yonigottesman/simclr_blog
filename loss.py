@@ -1,33 +1,114 @@
+from typing import Any, Dict
+
 import tensorflow as tf
 
 
 class SimCLRLoss(tf.keras.losses.Loss):
+    """SimCLR Loss.
+    [A Simple Framework for Contrastive Learning of Visual Representations](https://arxiv.org/abs/2002.05709)
+    code adapted from [original github](https://github.com/google-research/simclr/tree/master/tf2)
+    """
+
     LARGE_NUM = 1e9
 
     def __init__(self, temperature: float = 0.05, **kwargs):
-
         super().__init__(**kwargs)
         self.temperature = temperature
 
     def contrast(self, hidden1, hidden2):
 
+        # local replica batch size
         batch_size = tf.shape(hidden1)[0]
 
-        labels = tf.one_hot(tf.range(batch_size), batch_size * 2)
-        masks = tf.one_hot(tf.range(batch_size), batch_size)
+        if not tf.distribute.in_cross_replica_context():
+            # SimCLR loss computes similarity with 2N-1 other examples, when N is the global_batch_size.
+            # In distributed training, each replica sees only N/n_replicas examples and to compare with all 2N-1
+            # examples we must first get them from other replicas.
+            strategy = tf.distribute.get_strategy()
+            hidden1_large = SimCLRLoss.cross_replica_concat(hidden1, strategy)
+            hidden2_large = SimCLRLoss.cross_replica_concat(hidden2, strategy)
+            enlarged_batch_size = tf.shape(hidden1_large)[0]
+            replica_context = tf.distribute.get_replica_context()
+            labels_idx = tf.range(batch_size) + replica_context.replica_id_in_sync_group * batch_size
+            labels = tf.one_hot(labels_idx, enlarged_batch_size * 2)
+            masks = tf.one_hot(labels_idx, enlarged_batch_size)
+        else:
+            hidden1_large = hidden1
+            hidden2_large = hidden2
+            labels = tf.one_hot(tf.range(batch_size), batch_size * 2)
+            masks = tf.one_hot(tf.range(batch_size), batch_size)
 
-        logits_aa = tf.matmul(hidden1, hidden1, transpose_b=True) / self.temperature
-        logits_aa = logits_aa - masks * SimCLRLoss.LARGE_NUM
+        # compute pairwise
+        ab = tf.matmul(hidden1, hidden2_large, transpose_b=True) / self.temperature
+        aa = tf.matmul(hidden1, hidden1_large, transpose_b=True) / self.temperature
 
-        logits_ab = tf.matmul(hidden1, hidden2, transpose_b=True) / self.temperature
-        loss_a = tf.nn.softmax_cross_entropy_with_logits(labels, tf.concat([logits_ab, logits_aa], 1))
+        # set the diagonal to a large negative number to ensure that z_i * z_i
+        # is close to zero in the cross entropy.
+        aa = aa - masks * SimCLRLoss.LARGE_NUM
 
-        return loss_a
+        distances = tf.concat((ab, aa), axis=1)
 
-    def call(self, hidden1, hidden2):
-        hidden1 = tf.math.l2_normalize(hidden1, -1)
-        hidden2 = tf.math.l2_normalize(hidden2, -1)
-        loss_a = self.contrast(hidden1, hidden2)
-        loss_b = self.contrast(hidden2, hidden1)
+        # 1D tensor
+        per_example_loss = tf.nn.softmax_cross_entropy_with_logits(labels, distances)
 
-        return loss_a + loss_b
+        return per_example_loss
+
+    def call(self, za, zb):
+        """Compute the loss.
+        Args:
+            za: Embedding A
+            zb: Embedding B
+        Returns:
+            loss: Per replica loss
+        """
+        # We expect za and zb to be rank 2 tensors.
+        za = tf.math.l2_normalize(za, axis=1)
+        zb = tf.math.l2_normalize(zb, axis=1)
+
+        loss_a = self.contrast(za, zb)
+        loss_b = self.contrast(zb, za)
+
+        # When used inside of built-in training loops such as Model.fit, tf.keras.losses.Reduction
+        # will default to SUM_OVER_BATCH_SIZE which takes into account the global batch size across all GPUs.
+        loss = loss_a + loss_b
+        return loss
+
+    @staticmethod
+    def cross_replica_concat(tensor, strategy):
+        """Reduce a concatenation of the `tensor` across TPU cores.
+        Args:
+            tensor: tensor to concatenate.
+            strategy: A `tf.distribute.Strategy`. If not set, CPU execution is assumed.
+        Returns:
+            Tensor of the same rank as `tensor` with first dimension `num_replicas`
+            times larger.
+        """
+        num_replicas = strategy.num_replicas_in_sync
+
+        replica_context = tf.distribute.get_replica_context()
+        with tf.name_scope("cross_replica_concat"):
+            # This creates a tensor that is like the input tensor but has an added
+            # replica dimension as the outermost dimension. On each replica it will
+            # contain the local values and zeros for all other values that need to be
+            # fetched from other replicas.
+            ext_tensor = tf.scatter_nd(
+                indices=[[replica_context.replica_id_in_sync_group]],
+                updates=[tensor],
+                shape=tf.concat([[num_replicas], tf.shape(tensor)], axis=0),
+            )
+
+            # As every value is only present on one replica and 0 in all others, adding
+            # them all together will result in the full tensor on all replicas.
+            ext_tensor = replica_context.all_reduce(tf.distribute.ReduceOp.SUM, ext_tensor)
+
+            # Flatten the replica dimension.
+            # The first dimension size will be: tensor.shape[0] * num_replicas
+            # Using [-1] trick to support also scalar input.
+            return tf.reshape(ext_tensor, [-1] + ext_tensor.shape.as_list()[2:])
+
+    def get_config(self) -> Dict[str, Any]:
+        config = {
+            "temperature": self.temperature,
+        }
+        base_config = super().get_config()
+        return {**base_config, **config}

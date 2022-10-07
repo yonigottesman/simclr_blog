@@ -49,7 +49,7 @@ def crop_and_resize(image, height, width):
     return tf.image.resize([image], [height, width], tf.image.ResizeMethod.BICUBIC)[0]
 
 
-def color_jitter(image, strength=1):
+def color_jitter(image, strength=1.0):
     brightness = 0.8 * strength
     contrast = 0.8 * strength
     saturation = 0.8 * strength
@@ -106,7 +106,9 @@ def gaussian_blur(image, kernel_size, sigma, padding="SAME"):
     return blurred
 
 
-def preprocess_for_train(image, height, width, color_distort=True, crop=True, flip=True, blur=True, jitter_strength=1):
+def preprocess_for_train(
+    image, height, width, color_distort=True, crop=True, flip=True, blur=True, jitter_strength=1.0
+):
     if crop:
         image = random_apply(lambda image: crop_and_resize(image, height, width), p=1, x=image)
     if flip:
